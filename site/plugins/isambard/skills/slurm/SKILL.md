@@ -50,7 +50,12 @@ resources become available.
 | Isambard 3 Grace | — | 144 (2 × 72-core Superchips) | CPU-only; shared between users by default |
 | Isambard 3 MACS | — | Varies | x86_64 nodes; check specs |
 
-Max walltime on all systems: **24 hours**. See the [job scheduling page](https://docs.isambard.ac.uk/user-documentation/information/job-scheduling/) for partition limits and per-project quotas.
+Max walltime on all systems: **under 24 hours**. The QOS still prints `MaxWall 1-00:00:00`, but a `--time=24:00:00`
+request is no longer accepted on Isambard-AI (observed 2026-09-15). Slurm rounds a time request **up to whole
+minutes**, so `--time=23:59:59` becomes the same 1440-minute limit as 24:00:00 (`scontrol show job <id>` prints
+`TimeLimit=1-00:00:00`). The longest request that stays under the limit is therefore `--time=23:59:00` (1439 minutes).
+A run that needs longer is chained: a second job with the same command and `--dependency=afterany:<first job>` that
+resumes from a checkpoint. See the [job scheduling page](https://docs.isambard.ac.uk/user-documentation/information/job-scheduling/) for partition limits and per-project quotas.
 
 ---
 
