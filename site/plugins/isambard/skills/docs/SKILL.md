@@ -140,7 +140,23 @@ rm -rf "${WORKDIR}"
 ```
 
 - `$HOME` is for scripts and configs — **not large datasets**.
-- `$LOCALDIR` on compute nodes is a **tmpfs RAM disk** — very fast but limited.
+- **The 100 GiB `$HOME` quota fills silently through tool caches, not through anything you put there on
+  purpose.** Observed 2026-09-17: 103 GiB used against a 101 GiB limit, of which `~/.cache/huggingface`
+  held 56 GiB (a FLUX.2 4-bit checkpoint 32 GiB, SD3-medium 15 GiB, three NV-Generate models), `~/.cache/modelscope`
+  21 GiB from a run ten months earlier, `~/.cache/torch` 1.4 GiB (torchvision / LPIPS weights), a 3.6 GiB
+  venv a tool had just created under `~/.cache`. The first symptoms are not about disk: `git push` fails with
+  `unable to get credential storage lock ... Disk quota exceeded`, `claude plugin update` fails with
+  `could not create work tree dir`, and any job writing a log under `$HOME` dies. Check with `quota -s`
+  (the `home` line: space used against the limit) and `du -sh --apparent-size ~/.cache/*`. Keep the caches
+  off `$HOME` from the start by exporting, in `.bashrc`, `HF_HOME`, `MODELSCOPE_CACHE`, `TORCH_HOME`,
+  `UV_CACHE_DIR`, `PIP_CACHE_DIR` and `XDG_CACHE_HOME` to a directory under `$PROJECTDIR` or your workspace on
+  Lustre; when it has already happened, move the directory there and leave a symlink in place
+  (`rsync -a src/ dst/`, compare file counts and byte totals, `rm -rf src && ln -s dst src`): every reader
+  keeps working and 77 GiB came back in four minutes. Model files that a running job has mapped stay valid
+  while the move happens, because the inode lives until it is unmapped.
+- `$LOCALDIR` on compute nodes is a **tmpfs RAM disk** — very fast but limited, and on a login or tunnel
+  session it is also where `$TMPDIR` points, so a tool that caches under `$TMPDIR` is spending the session's
+  memory cap and loses the cache at logout.
 - Never assume `$LOCALDIR` data survives between jobs.
 - Backup important results off-system before the project end date.
 
@@ -282,6 +298,7 @@ Before submitting any AI-generated code or job script to BriCS:
 | Leaving temp files in `$SCRATCHDIR` or `$LOCALDIR` after a job | Wastes quota; may cause future jobs to fail on space | Explicitly delete temp files at the end of your job script |
 | Raising a support ticket for a known outage | Unnecessary load on the helpdesk | Always check https://status.isambard.ac.uk before submitting a ticket |
 | Forgetting `clifton auth` | SSH fails | Run daily before connecting |
+| Model and package caches left at their defaults under `~/.cache` | `$HOME` hits its 100 GiB quota unnoticed; `git push`, plugin installs and log writes then fail with "Disk quota exceeded" | Export `HF_HOME`, `MODELSCOPE_CACHE`, `TORCH_HOME`, `UV_CACHE_DIR`, `XDG_CACHE_HOME` to Lustre; move an existing cache and symlink it (see Storage Spaces) |
 
 ---
 
