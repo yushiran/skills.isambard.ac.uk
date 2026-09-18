@@ -1,0 +1,16 @@
+{
+  "description": "On every user message, put the user's Slurm queue and each running job's latest log line into context, so the assistant knows the job state before it answers and never has to be asked what is running.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/squeue_context.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
