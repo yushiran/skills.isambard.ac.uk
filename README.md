@@ -34,7 +34,7 @@ marketplace as `isambard@yushiran-research`) and are not served at skills.isamba
 | Part | What it is | When it fires |
 |---|---|---|
 | [slurm-watch](site/plugins/isambard/skills/slurm-watch/SKILL.md) | Watch a long Slurm job to its read point and evaluate it in the turn it ends; `scripts/job_status.sh` prints state, latest log record and a windowed ratio | when a job is submitted or asked about |
-| [hooks/squeue_context.sh](site/plugins/isambard/hooks/squeue_context.sh) | `UserPromptSubmit` hook: the user's queue and each running job's last log line, into context | every user message; silent when the queue is empty |
+| [hooks/squeue_context.sh](site/plugins/isambard/hooks/squeue_context.sh) | `UserPromptSubmit` hook: the user's queue and each running job's last log line, into context, from a snapshot refreshed in the background at most once a minute, so a message never waits for Slurm | every user message; silent when the queue is empty |
 | [agents/repo-reader](site/plugins/isambard/agents/repo-reader.md) | reads a baseline's released code and paper; equations with `file:line`, per-step cost | dispatched by name |
 | [agents/library-surveyor](site/plugins/isambard/agents/library-surveyor.md) | answers from a `references/<topic>/` library through its `INDEX.md`, never traversing it | dispatched by name |
 
