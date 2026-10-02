@@ -1,4 +1,4 @@
 {
-  "description": "The Slurm queue as a mod: one line above the prompt while jobs are queued, /slurm for the full table, toasts when a job starts or leaves the queue, and a few lines of queue state beside each prompt for the model. Inert where squeue is missing. Needs Claude Code 2.1.287 or later.",
+  "description": "The Slurm queue as a mod: one line above the prompt while jobs are queued, /queue for the full table, toasts when a job starts or leaves the queue, and a few lines of queue state beside each prompt for the model. Inert where squeue is missing. Needs Claude Code 2.1.287 or later.",
   "modules": ["./register.tsx"]
 }

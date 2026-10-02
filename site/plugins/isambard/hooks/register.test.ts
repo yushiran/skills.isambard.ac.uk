@@ -13,11 +13,12 @@ const QUEUE = [
 const answer = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
 // the machine beneath the plugin: whether squeue exists, and what it prints
-function world(on: On, machine: { hasSqueue: boolean; queue: () => string }) {
+function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refuseCommand?: boolean }) {
   const calls: string[] = []
   mock.clock(on, { now: 1_000_000 })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  // the engine refuses a name another part of the plugin owns, as it refused /slurm on 2026-10-02
+  on('command.register', (_$, e) => (machine.refuseCommand ? { deny: `"/${e.name}" refused: it is the plugin's /isambard:${e.name}` } : { value: { command: e.name } }))
   on('prompt.submit', (_$, e) => ({ text: e.text, context: e.context }))
   on('process.run', (_$, e) => {
     const cmd = e.argv[0]!
@@ -62,7 +63,7 @@ test('no squeue on the machine: no command, no poll, nothing beside the prompt',
 test('jobs in the queue: a few lines beside the prompt, the log line of a running task', async ($, on) => {
   world(on, { hasSqueue: true, queue: () => QUEUE })
   await $.session.start(START)
-  const polled = await $.command.run({ command: 'slurm', args: 'refresh' })
+  const polled = await $.command.run({ command: 'queue', args: 'refresh' })
   expect(polled.text).toContain('37 pending (QOSMaxJobsPerUserLimit)')
   const sent = await $.prompt.submit({ text: 'how are the jobs' })
   const context = (sent.context ?? []).join('\n')
@@ -75,13 +76,20 @@ test('an empty queue says nothing, and says "empty" once after jobs drain', asyn
   let queue = ''
   world(on, { hasSqueue: true, queue: () => queue })
   await $.session.start(START)
-  await $.command.run({ command: 'slurm', args: 'refresh' })
+  await $.command.run({ command: 'queue', args: 'refresh' })
   expect((await $.prompt.submit({ text: 'a' })).context ?? []).toEqual([])
   queue = QUEUE
-  await $.command.run({ command: 'slurm', args: 'refresh' })
+  await $.command.run({ command: 'queue', args: 'refresh' })
   expect(((await $.prompt.submit({ text: 'b' })).context ?? []).join()).toContain('celeba128_e43')
   queue = ''
-  await $.command.run({ command: 'slurm', args: 'refresh' })
+  await $.command.run({ command: 'queue', args: 'refresh' })
   expect(((await $.prompt.submit({ text: 'c' })).context ?? []).join()).toContain('empty')
   expect((await $.prompt.submit({ text: 'd' })).context ?? []).toEqual([])
+})
+
+test('a refused command name stops nothing: the first prompt still gets the queue', async ($, on) => {
+  world(on, { hasSqueue: true, queue: () => QUEUE, refuseCommand: true })
+  await $.session.start(START)
+  const context = ((await $.prompt.submit({ text: 'first prompt of the session' })).context ?? []).join('\n')
+  expect(context).toContain('celeba128_e43 (array 7023772): 2 running, 37 pending')
 })

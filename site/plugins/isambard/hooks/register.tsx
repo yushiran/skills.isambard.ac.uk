@@ -1,5 +1,5 @@
 // Slurm queue on Isambard: one line above the prompt while jobs are queued,
-// /slurm for the full table, a toast when a job starts or leaves the queue,
+// /queue for the full table, a toast when a job starts or leaves the queue,
 // and a few lines of queue state beside each prompt for the model.
 // Replaces squeue_context.sh (UserPromptSubmit), which put the whole queue into
 // every message: 18-32 KB per prompt on a 328-task array (2026-10-02).
@@ -10,6 +10,7 @@ const FIELDS = '%F|%K|%i|%j|%T|%M|%L|%R'
 const BUSY_MS = 60_000 // the cluster's minimum interval between scripted polls
 const IDLE_MS = 300_000 // empty queue, or Slurm not answering
 const MIN_GAP_MS = 15_000 // a poke after sbatch never polls closer than this
+const FIRST_POLL_WAIT_MS = 3000 // how long the first prompt of a session waits for the first poll
 const LOG_GROUPS = 4 // groups whose newest log line is read on each poll
 const TUNNEL_WARN_S = 30 * 60
 const PANE = 'slurm'
@@ -268,13 +269,18 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     if (await probe($)) {
-      await $.command.register({ name: 'slurm', description: 'Show the Slurm queue in a pane; /slurm refresh polls now' })
-      void poll($)
+      void poll($) // first, so a refused command name cannot stop the polling
+      try {
+        // not /slurm: the plugin's own slurm skill owns that name and the engine refuses it
+        await $.command.register({ name: 'queue', description: 'Show the Slurm queue in a pane; /queue refresh polls now and prints it' })
+      } catch {
+        // the band and the context work without the command
+      }
     }
     return next(e)
   })
 
-  on('command.run', { command: 'slurm' }, async ($, e, next) => {
+  on('command.run', { command: 'queue' }, async ($, e, next) => {
     if (!(await probe($))) return next(e)
     const now = await $.clock.now()
     if (e.args.trim() === 'refresh' || now - triedAt > MIN_GAP_MS) await poll($)
@@ -297,6 +303,8 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     if (!contextOn || !hasSlurm) return next(e)
+    // a prompt typed right after start waits briefly for the first answer
+    if (!primed && inflight) await Promise.race([inflight, $.clock.sleep(FIRST_POLL_WAIT_MS)])
     const text = contextText(await $.clock.now())
     return text ? next({ ...e, context: [...(e.context ?? []), text] }) : next(e)
   })
@@ -319,7 +327,7 @@ export const register: Register = (on, options) => {
               : g.running ? ` ${span(seconds(g.elapsed))} · ${span(g.leftS)} left` : ` wait${g.reason ? ` (${g.reason})` : ''}`}
           </Text>
         ))}
-        {jobs.length > shown.length && <Text dimColor>+{jobs.length - shown.length} more · /slurm</Text>}
+        {jobs.length > shown.length && <Text dimColor>+{jobs.length - shown.length} more · /queue</Text>}
         {tunnel && <Text color={tunnel.leftS >= 0 && tunnel.leftS <= TUNNEL_WARN_S ? '#FFD34E' : '#8A94AB'}>│ tunnel {span(tunnel.leftS)} left</Text>}
         {failures > 0 && <Text dimColor>· as of {age(now)} ago, squeue failing</Text>}
       </Box>
@@ -338,7 +346,7 @@ export const register: Register = (on, options) => {
             {g.log && <Text dimColor>  {g.log}</Text>}
           </Box>
         ))}
-        <Text dimColor>as of {age(now)} ago · next look in {groups.length && !failures ? '1 min' : '5 min'} · /slurm refresh</Text>
+        <Text dimColor>as of {age(now)} ago · next look in {groups.length && !failures ? '1 min' : '5 min'} · /queue refresh</Text>
       </Box>
     )
   })
