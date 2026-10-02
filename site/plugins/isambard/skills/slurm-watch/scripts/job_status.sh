@@ -21,7 +21,14 @@ ST=$(squeue -h -j "$ID" -o '%T|%M' 2>/dev/null | head -1)
 if [ -z "$ST" ]; then
   FINAL=$(sacct -j "$ID" -X --format=State,Elapsed -n 2>/dev/null | head -1 | tr -s ' ')
   echo "job $ID ENDED: ${FINAL:-unknown}"
-  OUT=$(sacct -j "$ID" -X --format=StdOut -n 2>/dev/null | tr -d ' ' | head -1)
+  # sacct reports StdOut as the unexpanded pattern (e.g. logs/%x-%j.out), so [ -f ] never held and no error was ever shown
+  # OUT=$(sacct -j "$ID" -X --format=StdOut -n 2>/dev/null | tr -d ' ' | head -1)
+  ROW=$(sacct -j "$ID" -X -n -P --format=StdOut,JobName,JobID,JobIDRaw,User 2>/dev/null | head -1)
+  IFS='|' read -r OUT NAME JOBID RAWID WHO <<< "$ROW"
+  MASTER=${JOBID%%_*}; TASK=""; [ "$JOBID" != "$MASTER" ] && TASK=${JOBID#*_}
+  OUT=${OUT//%%/$'\x01'}; OUT=${OUT//%A/$MASTER}; OUT=${OUT//%a/$TASK}; OUT=${OUT//%j/$RAWID}
+  OUT=${OUT//%x/$NAME}; OUT=${OUT//%u/$WHO}; OUT=${OUT//$'\x01'/%}
+  [ -n "$OUT" ] && [ ! -f "$OUT" ] && echo "log not found: $OUT"
   [ -n "$OUT" ] && [ -f "$OUT" ] && grep -E 'Traceback|Error|Killed|OutOfMemory|TIMEOUT|CANCELLED' "$OUT" | tail -3
   CODE=10
 else
@@ -32,7 +39,14 @@ if [ -n "$LOG" ] && [ -f "$LOG" ]; then
   python3 - "$LOG" "$NUM" "$DEN" "$WIN" <<'PY'
 import sys, json
 log, num, den, win = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-rows = [json.loads(l) for l in open(log) if l.strip()]
+# a log still being written can end in half a line; one bad line used to crash the whole report
+# rows = [json.loads(l) for l in open(log) if l.strip()]
+rows = []
+for line in open(log):
+    try:
+        rows.append(json.loads(line))
+    except ValueError:
+        pass
 if not rows:
     print("log is empty"); sys.exit(0)
 last = rows[-1]

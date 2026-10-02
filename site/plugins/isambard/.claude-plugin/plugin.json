@@ -1,7 +1,7 @@
 {
   "name": "isambard",
   "description": "AI agent skills for Isambard HPC systems, plus a job watch to a read point, a Slurm queue mod (a line above the prompt, /queue, toasts, a short queue summary beside each prompt), and two research subagents (repo-reader, library-surveyor)",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "userConfig": {
     "tunnelName": {
       "type": "string",
