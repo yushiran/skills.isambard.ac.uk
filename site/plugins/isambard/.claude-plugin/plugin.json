@@ -1,7 +1,7 @@
 {
   "name": "isambard",
   "description": "AI agent skills for Isambard HPC systems, plus a job watch to a read point, a Slurm queue mod (a line above the prompt, /queue, toasts, a short queue summary beside each prompt), and two research subagents (repo-reader, library-surveyor)",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "userConfig": {
     "tunnelName": {
       "type": "string",
@@ -15,6 +15,13 @@
       "description": "on: a few lines of queue state go beside each prompt while jobs are queued, and one line when the queue drains; off: the model sees nothing unless it runs squeue",
       "options": ["on", "off"],
       "default": "on"
+    },
+    "wake": {
+      "type": "string",
+      "title": "Wake the model when its job ends",
+      "description": "on: when a job this session submitted leaves the queue, the model gets a prompt of its own (counts, last error line) and reads the result; off: an ended job is told once beside the next prompt you type",
+      "options": ["on", "off"],
+      "default": "off"
     }
   }
 }
