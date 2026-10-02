@@ -1,5 +1,20 @@
 {
   "name": "isambard",
-  "description": "AI agent skills for Isambard HPC systems, plus a job watch to a read point, a UserPromptSubmit hook that keeps the Slurm queue in context, and two research subagents (repo-reader, library-surveyor)",
-  "version": "1.1.1"
+  "description": "AI agent skills for Isambard HPC systems, plus a job watch to a read point, a Slurm queue mod (a line above the prompt, /slurm, toasts, a short queue summary beside each prompt), and two research subagents (repo-reader, library-surveyor)",
+  "version": "1.2.0",
+  "userConfig": {
+    "tunnelName": {
+      "type": "string",
+      "title": "Tunnel job name",
+      "description": "The Slurm job name of the VS Code tunnel; it is shown apart from the other jobs with its time left, and a toast warns 30 minutes before it ends",
+      "default": "code_tunnel"
+    },
+    "context": {
+      "type": "string",
+      "title": "Queue beside each prompt",
+      "description": "on: a few lines of queue state go beside each prompt while jobs are queued, and one line when the queue drains; off: the model sees nothing unless it runs squeue",
+      "options": ["on", "off"],
+      "default": "on"
+    }
+  }
 }

@@ -1,16 +1,4 @@
 {
-  "description": "On every user message, put the user's Slurm queue and each running job's latest log line into context, so the assistant knows the job state before it answers and never has to be asked what is running.",
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/squeue_context.sh\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
+  "description": "The Slurm queue as a mod: one line above the prompt while jobs are queued, /slurm for the full table, toasts when a job starts or leaves the queue, and a few lines of queue state beside each prompt for the model. Inert where squeue is missing. Needs Claude Code 2.1.287 or later.",
+  "modules": ["./register.tsx"]
 }
