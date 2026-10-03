@@ -176,6 +176,8 @@ Login nodes are **shared** and must not be used for compute-intensive or long-ru
 
 > Using `squeue -i` or `watch squeue` excessively disrupts **all users** and is a breach of the Acceptable Use Policy. Use `squeue --me` once to check, or set a reasonable interval.
 
+> Observed on the login nodes: an interactive agent session was killed (SIGKILL, exit 137) by a per-session memory cap of about 4 GB that tightens when the node is busy; loading a ~1 GB `.mat` (the parse peaks near 1.6 GB) next to an `import torch` (about 0.65 GB) was enough. Check `hostname` first: a `nid…` host is a compute node, where no such cap was seen. On a login node read small files only (json, csv, npz) and load large ones on a compute node or in the user's own shell.
+
 ---
 
 ## Software and Environments
