@@ -1,7 +1,12 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { collapse, expandLogPattern, parseRows, seconds, span, taskCount } from './register.tsx'
+// import { collapse, expandLogPattern, parseRows, seconds, span, taskCount } from './register.tsx'
+// import { collapse, expandLogPattern, parseGpuMinutes, parseRows, seconds, span, taskCount, usageText } from './register.tsx'
+import {
+  collapse, defaultPartition, expandLogPattern, fillBar, fitBand, gpuBar, parseCluster, parseGpuMinutes, parseQuota,
+  parseRows, projectName, seconds, span, taskCount, tib, usageText,
+} from './register.tsx'
 
 const QUEUE = [
   '7023772|292-328|7023772_[292-328]|celeba128_e43|PENDING|0:00|4:00:00|(QOSMaxJobsPerUserLimit)',
@@ -26,7 +31,9 @@ const ARRAY_ROWS = [
 type Seen = { prompts: string[]; argv: string[][]; clock?: ReturnType<typeof mock.clock> }
 
 // the machine beneath the plugin: whether squeue exists, and what it prints
-function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refuseCommand?: boolean; sacct?: string; planFolder?: string; toolResult?: () => object }, seen?: Seen) {
+// function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refuseCommand?: boolean; sacct?: string; planFolder?: string; toolResult?: () => object }, seen?: Seen) {
+// function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refuseCommand?: boolean; sacct?: string; planFolder?: string; toolResult?: () => object; assoc?: string }, seen?: Seen) {
+function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refuseCommand?: boolean; sacct?: string; planFolder?: string; toolResult?: () => object; assoc?: string; partitions?: string; sinfo?: string; lfsProject?: string; quota?: string }, seen?: Seen) {
   const calls: string[] = []
   const clock = mock.clock(on, { now: 1_000_000 })
   if (seen) seen.clock = clock
@@ -47,6 +54,10 @@ function world(on: On, machine: { hasSqueue: boolean; queue: () => string; refus
     if (cmd === 'sh') return answer(machine.hasSqueue ? '/usr/bin/squeue\n' : '', machine.hasSqueue ? 0 : 1)
     if (cmd === 'id') return answer('alice\n')
     if (cmd === 'squeue') return answer(machine.queue())
+    if (cmd === 'scontrol' && e.argv[2] === 'assoc_mgr') return answer(machine.assoc ?? '')
+    // sinfo: the default partition (-o %P) or the per-node GPU and state table; lfs: the folder's project id, then its quota
+    if (cmd === 'sinfo') return e.argv.includes('%P') ? answer(machine.partitions ?? '', machine.partitions ? 0 : 1) : answer(machine.sinfo ?? '', machine.sinfo ? 0 : 1)
+    if (cmd === 'lfs') return e.argv[1] === 'project' ? answer(machine.lfsProject ?? '', machine.lfsProject ? 0 : 1) : answer(machine.quota ?? '', machine.quota ? 0 : 1)
     if (cmd === 'scontrol') return answer('JobId=7023772 StdOut=/work/logs/291.out\n')
     if (cmd === 'tail' && e.argv[3] === FAILED_LOG) return answer('step 10 loss 0.3\nTraceback (most recent call last):\n  File "train.py", line 9\nValueError: bad shape (3, 5)\n')
     if (cmd === 'tail') return answer('celeba_000 psnr 30.55 lpips 0.151\n\n')
@@ -259,4 +270,199 @@ test('wake on: a denied sbatch records no own job', { options: { wake: 'on' } },
   await seen.clock!.advance(80_000)
   await seen.clock!.settle()
   expect(seen.prompts).toEqual([])
+})
+
+// `scontrol show assoc_mgr users=alice flags=assoc` as Isambard-AI printed it on 2026-10-03 (lines shortened)
+const ASSOC = [
+  'Current Association Manager state',
+  '',
+  'Association Records',
+  '',
+  'ClusterName=gracehopper Account=brics.b5ak UserName=alice(1000) Partition= Priority=0 ID=1613',
+  '    GrpTRESMins=cpu=N(2124414),mem=N(3391090161),node=N(29505),billing=N(2124414),gres/gpu=N(29505),gres/gpumem=N(0)',
+  '    GrpTRESRunMins=cpu=N(51124),gres/gpu=N(710)',
+].join('\n')
+
+test('this month\'s GPU node hours from the association usage counter', () => {
+  expect(parseGpuMinutes(ASSOC)).toEqual(new Map([['brics.b5ak', 29505]]))
+  // a record with a limit set still gives its usage; the running-job counter is not usage
+  const limited = 'ClusterName=gracehopper Account=brics.x12 UserName=alice(1000)\n    GrpTRESMins=gres/gpu=240000(480)\n    GrpTRESRunMins=gres/gpu=N(9999)'
+  expect(parseGpuMinutes(`${ASSOC}\n${limited}`)).toEqual(new Map([['brics.b5ak', 29505], ['brics.x12', 480]]))
+  expect(parseGpuMinutes('JobId=7023772 StdOut=/work/logs/291.out')).toEqual(new Map())
+  expect(usageText(new Map())).toBe('')
+  expect(usageText(new Map([['brics.b5ak', 29505]]))).toBe('122.9 NHR this month')
+  expect(usageText(new Map([['brics.b5ak', 29505], ['brics.x12', 480]]))).toBe('b5ak 122.9 · x12 2.0 NHR this month')
+})
+
+test('the usage counter is read at most every five minutes and shown by /queue refresh; an unreadable one shows nothing', async ($, on) => {
+  const seen: Seen = { prompts: [], argv: [] }
+  world(on, { hasSqueue: true, queue: () => QUEUE, assoc: ASSOC }, seen)
+  await $.session.start(START)
+  await seen.clock!.settle()
+  const reads = () => seen.argv.filter(argv => argv[0] === 'scontrol' && argv[2] === 'assoc_mgr').length
+  expect(reads()).toBe(1)
+  expect((await $.command.run({ command: 'queue', args: 'refresh' })).text).toContain('122.9 NHR this month')
+  expect(reads()).toBe(1)
+  await seen.clock!.advance(300_000)
+  await seen.clock!.settle()
+  expect(reads()).toBe(2)
+})
+
+test('no usage line when the counter answers nothing', async ($, on) => {
+  world(on, { hasSqueue: true, queue: () => QUEUE })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'queue', args: 'refresh' })).text).not.toContain('NHR')
+})
+
+// `sinfo -h -N -p workq -O Gres:40,GresUsed:60,StateCompact:16`, one node per state (a GH200 node has 4 GPUs)
+const SINFO = [
+  'gpu:4(S:0-3)   gpu:gh200:4(IDX:0-3)    alloc',
+  'gpu:4(S:0-3)   gpu:gh200:2(IDX:0-1)    mix',
+  'gpu:4(S:0-3)   gpu:(null):0(IDX:N/A)   idle',
+  'gpu:4(S:0-3)   gpu:(null):0(IDX:N/A)   resv',
+  'gpu:4(S:0-3)   gpu:(null):0(IDX:N/A)   drain*',
+  'gpu:4(S:0-3)   gpu:(null):0(IDX:N/A)   down*',
+  'gpu:4(S:0-3)   gpu:gh200:4(IDX:0-3)    comp',
+].join('\n')
+// `lfs quota -p 1483801647 /lus/lfs1aip2/projects/b5ak` as Isambard-AI printed it on 2026-10-03: kbytes and files
+const QUOTA = [
+  'Disk quotas for prj 1483801647 (pid 1483801647):',
+  '     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace',
+  '/lus/lfs1aip2/projects/b5ak',
+  '                78173842908       0 214748364800       - 4044325       0 51200000       -',
+].join('\n')
+
+test('the cluster from sinfo: nodes by state, and the GPUs free on idle and partly used nodes', () => {
+  expect(defaultPartition('workq*\ninteractive\n')).toBe('workq')
+  expect(defaultPartition('interactive\n')).toBe('interactive')
+  expect(parseCluster(SINFO, 'workq')).toEqual({ partition: 'workq', nodes: 7, gpus: 28, free: 6, full: 2, partly: 1, idle: 1, reserved: 1, down: 2 })
+  expect(parseCluster('', 'workq').nodes).toBe(0)
+})
+
+test('the project quota from lfs quota, in TB and millions of files', () => {
+  expect(parseQuota(QUOTA)).toEqual({ usedKB: 78173842908, limitKB: 214748364800, files: 4044325, filesLimit: 51200000 })
+  expect(parseQuota('lfs: no such project')).toBeUndefined()
+  expect(tib(78173842908)).toBe('72.8')
+  expect(tib(214748364800)).toBe('200')
+  expect(projectName('/lus/lfs1aip2/projects/b5ak/kc25870.b5ak/workspace', '1483801647')).toBe('b5ak')
+  expect(projectName('/work', '1483801647')).toBe('project 1483801647')
+})
+
+test('bars fill their width exactly, with an eighth block at the edge of the fill', () => {
+  const width = (spans: { text: string }[]) => spans.map(s => s.text).join('').length
+  const filled = fillBar(0.364, 20, '#7DC4FF')
+  expect(width(filled)).toBe(20)
+  expect(filled[0]!.text).toBe('███████')
+  expect(filled[1]!.text).toBe('▎')
+  expect(width(fillBar(1.2, 10, '#7DC4FF'))).toBe(10)
+  expect(width(fillBar(0, 10, '#7DC4FF'))).toBe(10)
+})
+
+test('the band drops its least important items first and never the tunnel', () => {
+  const items = [{ id: 'tunnel', width: 14, keep: true }, { id: 'job1', width: 30, keep: true }, { id: 'nhr', width: 9 }, { id: 'job2', width: 25 }, { id: 'cluster', width: 18 }]
+  expect(fitBand(items, 200)).toEqual(['tunnel', 'job1', 'nhr', 'job2', 'cluster'])
+  expect(fitBand(items, 90)).toEqual(['tunnel', 'job1', 'nhr', 'job2'])
+  expect(fitBand(items, 80)).toEqual(['tunnel', 'job1', 'nhr'])
+  expect(fitBand(items, 40)).toEqual(['tunnel', 'job1'])
+})
+
+const RICH = { hasSqueue: true, queue: () => QUEUE, assoc: ASSOC, partitions: 'workq*\ninteractive\n', sinfo: SINFO, lfsProject: '1483801647 P /work', quota: QUOTA }
+
+test('/queue refresh tells the cluster and the project storage', async ($, on) => {
+  world(on, RICH)
+  await $.session.start(START)
+  const text = (await $.command.run({ command: 'queue', args: 'refresh' })).text ?? ''
+  expect(text).toContain('workq: 6 of 28 GPUs free')
+  expect(text).toContain('project 1483801647: 72.8 / 200 TB (36%), files 4.0 / 51.2 M')
+  expect(text).toContain('122.9 NHR this month')
+})
+
+for (const bodyColumns of [160, 90, 60]) {
+  test(`the pane draws at ${bodyColumns} columns: one row of meters (load, disk, use, tunnel) over the queue`, async ($, on) => {
+    const seen: Seen = { prompts: [], argv: [] }
+    world(on, RICH, seen)
+    await $.session.start(START)
+    await seen.clock!.settle()
+    const pane = await $.ui.mount({
+      plugin: 'isambard', surface: 'terminal', component: 'Pane', requestId: 'slurm',
+      props: { title: 'Isambard', isFocused: false, bodyColumns, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as never,
+    })
+    const drawn = (await pane.find({ type: 'Box' }))?.text ?? ''
+    for (const shown of ['6 free', 'disk', '36%', '122.9 NHR', 'tunnel', '17h46m', 'celeba128_e43']) expect(drawn).toContain(shown)
+    // minimal: no legend, no trend, no storage detail
+    for (const hidden of ['reserved', 'last 24 h', 'files']) expect(drawn).not.toContain(hidden)
+  })
+}
+
+for (const bodyColumns of [180, 60]) {
+  test(`the band at ${bodyColumns} columns keeps the tunnel's time`, async ($, on) => {
+    const seen: Seen = { prompts: [], argv: [] }
+    world(on, RICH, seen)
+    await $.session.start(START)
+    await seen.clock!.settle()
+    const band = await $.ui.mount({
+      plugin: 'isambard', surface: 'terminal', component: 'AbovePrompt',
+      props: { hasSurvey: false, isWorking: false, maxRows: 1, bodyColumns, scroll: { offset: 0, bodyRows: 1 }, view: {} } as never,
+    })
+    const drawn = (await band.find({ type: 'Box' }))?.text ?? ''
+    expect(drawn).toContain('tunnel 17h46m left')
+    if (bodyColumns >= 180) for (const shown of ['6 free', '36%', '122.9 NHR']) expect(drawn).toContain(shown)
+    else expect(drawn).not.toContain('NHR') // 60 columns: the job and the tunnel, the meters dropped
+  })
+}
+
+test('the band counts the jobs it left out', async ($, on) => {
+  const many = [1, 2, 3, 4].map(n => `70300${n}|N/A|70300${n}|sweep_${n}|RUNNING|1:00:00|3:00:00|nid01000${n}`).concat(TUNNEL_ONLY).join('\n')
+  const seen: Seen = { prompts: [], argv: [] }
+  world(on, { ...RICH, queue: () => many }, seen)
+  await $.session.start(START)
+  await seen.clock!.settle()
+  const drawnAt = async (bodyColumns: number) => (await (await $.ui.mount({
+    plugin: 'isambard', surface: 'terminal', component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 1, bodyColumns, scroll: { offset: 0, bodyRows: 1 }, view: {} } as never,
+  })).find({ type: 'Box' }))?.text ?? ''
+  const narrow = await drawnAt(80)
+  for (const shown of ['sweep_1', '+3 more', 'tunnel 17h46m left']) expect(narrow).toContain(shown)
+  expect(narrow).not.toContain('sweep_2')
+  const wide = await drawnAt(180)
+  for (const shown of ['sweep_3', '+1 more', '6 free', '122.9 NHR']) expect(wide).toContain(shown)
+})
+
+test('the gpu bar is shaded by position, its edge the brightest cell, and a glint lifts the edge toward white', () => {
+  const rest = gpuBar(0.84, 8, 0)
+  expect(rest.map(s => s.text).join('')).toBe('██████▊░')
+  expect(rest[0]!.color).toBe('#4C7BD9')
+  expect(rest[6]!.color).toBe('#76BAFA') // 6/7 of the way to #7DC4FF
+  expect(rest[7]!.color).toBe('#2E3440')
+  expect(gpuBar(0.84, 8, 1)[6]!.color).toBe('#BBDDFD') // half way to white
+  expect(gpuBar(1, 8, 0).at(-1)!.color).toBe('#7DC4FF')
+})
+
+// n idle nodes and the rest allocated, 4 GPUs each
+const NODES = (idle: number, total = 100) =>
+  Array.from({ length: total }, (_, i) => (i < idle ? 'gpu:4(S:0-3)   gpu:(null):0(IDX:N/A)   idle' : 'gpu:4(S:0-3)   gpu:gh200:4(IDX:0-3)    alloc')).join('\n')
+
+test('sinfo rides the 60 s poll; a changed reading rolls the free count over 0.8 s and the meter then holds still', async ($, on) => {
+  const machine = { ...RICH, sinfo: NODES(10) }
+  const seen: Seen = { prompts: [], argv: [] }
+  world(on, machine, seen)
+  await $.session.start(START)
+  await seen.clock!.settle()
+  const band = await $.ui.mount({
+    plugin: 'isambard', surface: 'terminal', component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 1, bodyColumns: 180, scroll: { offset: 0, bodyRows: 1 }, view: {} } as never,
+  })
+  const shown = async () => (await band.find({ type: 'Box' }))?.text ?? ''
+  const reads = () => seen.argv.filter(argv => argv[0] === 'sinfo' && !argv.includes('%P')).length
+  expect(await shown()).toMatch(/ 40 free/)
+  machine.sinfo = NODES(50)
+  await seen.clock!.advance(60_000)
+  expect(reads()).toBe(2)
+  expect(await shown()).toMatch(/ 40 free/) // the first frame starts from what was shown
+  await seen.clock!.advance(400)
+  expect(await shown()).toMatch(/ 180 free/) // ease-out: 87.5 % of the way after half the time
+  await seen.clock!.advance(800)
+  expect(await shown()).toMatch(/ 200 free/)
+  await seen.clock!.advance(30_000)
+  expect(await shown()).toMatch(/ 200 free/)
 })

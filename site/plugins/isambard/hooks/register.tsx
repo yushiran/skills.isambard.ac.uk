@@ -5,6 +5,10 @@
 // every message: 18-32 KB per prompt on a 328-task array (2026-10-02).
 // A group that leaves the queue is told to the model once, on its next prompt: counts, last error line, experiment-loop hint.
 // Option wake=on: a job this session submitted wakes the model with that line instead (one prompt per ended job).
+// This month's GPU node hours (1 NHR = 4 GPU hours) from the user's Slurm usage counter: in the band, the pane and /queue refresh.
+// Live meters (GPUs in use on the default partition, the project's disk quota, NHR, tunnel time left) spread across the
+// width: the band keeps one row and drops its least important items first, never the tunnel; the pane wraps them over the queue.
+// The gpu meter moves only when its 60 s reading changes: the count rolls and the lit edge glides and glints for 1.2 s, then holds still.
 // Inert where squeue is missing: no timer, no command, no band, no context.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
@@ -20,6 +24,21 @@ const FAILED_STATE = /^(failed|timeout|out_of_memory|node_fail|boot_fail|deadlin
 const ENDED_MAX = 8 // ended lines one prompt carries
 const PANE = 'slurm'
 const SUBMITS = /\b(sbatch|scancel|srun|salloc)\b|\bscontrol\s+(hold|release|requeue)\b/
+const USAGE_MS = 300_000 // Slurm recomputes association usage every 5 min (PriorityCalcPeriod)
+const GPU_MINUTES_PER_NHR = 240 // BriCS accounting: 1 node hour = 4 GPU hours on Isambard-AI
+// const CLUSTER_MS = 300_000 // sinfo at most every 5 min, well under the controller's rate limit
+const CLUSTER_MS = 60_000 // sinfo in the same tick as squeue: 60 s is the docs' floor for scripted polls (slurm-watch, AUP)
+const TICK_MS = 100 // 10 frames a second, the band's redraw cap
+const EASE_TICKS = 8 // a new reading: the free count rolls and the edge glides over 0.8 s
+const GLINT_TICKS = 12 // the edge glint fades by 1.2 s
+const GPU_SCARCE = 0.05 // the free count turns amber below 5 % of the partition's GPUs
+const STORAGE_MS = 1_800_000 // lfs quota at most every 30 min
+const STORAGE_WARN = 0.8 // the disk meter turns amber from 80 % full, red from 90 %
+const EIGHTHS = ' ▏▎▍▌▋▊▉' // left-aligned partial blocks, index = eighths of a cell
+// one palette for band and pane: cool blues for load, green for room, amber and red only for warnings
+const COLORS = {
+  label: '#7DC4FF', run: '#5FD17A', wait: '#E0B050', dim: '#8A94AB', warn: '#FFD34E', high: '#E06C75', load: '#4C7BD9', track: '#2E3440',
+}
 
 export type Row = { arrayId: string; task: string; id: string; name: string; state: string; elapsed: string; left: string; where: string }
 
@@ -122,6 +141,175 @@ export function describe(g: Group): string {
   return `${g.name} (${g.key}): ${g.other ? 'completing' : 'unknown state'}`
 }
 
+/**
+ * GPU minutes used per account, from `scontrol show assoc_mgr users=<u> flags=assoc`: the usage in brackets of
+ * GrpTRESMins gres/gpu. Isambard-AI resets this counter monthly with no decay, so it is this month's use of the
+ * user's own jobs; the project's limit sits on the account association, which members cannot read.
+ */
+export function parseGpuMinutes(text: string): Map<string, number> {
+  const used = new Map<string, number>()
+  for (const record of text.split(/(?=ClusterName=)/)) {
+    const account = /\bAccount=(\S+)/.exec(record)?.[1]
+    const minutes = /\bGrpTRESMins=\S*?gres\/gpu=[^(,\s]*\((\d+)\)/.exec(record)?.[1]
+    if (account && minutes !== undefined) used.set(account, (used.get(account) ?? 0) + Number(minutes))
+  }
+  return used
+}
+
+/** "122.9 NHR this month", or "b5ak 122.9 · x12 2.0 NHR this month" for several accounts; '' when unknown. */
+export function usageText(used: Map<string, number>): string {
+  if (!used.size) return ''
+  const nhr = (minutes: number) => (minutes / GPU_MINUTES_PER_NHR).toFixed(1)
+  if (used.size === 1) return `${nhr([...used.values()][0]!)} NHR this month`
+  return `${[...used].map(([account, minutes]) => `${account.replace(/^brics\./, '')} ${nhr(minutes)}`).join(' · ')} NHR this month`
+}
+
+export type Cluster = { partition: string; nodes: number; gpus: number; free: number; full: number; partly: number; idle: number; reserved: number; down: number }
+export type Quota = { usedKB: number; limitKB: number; files: number; filesLimit: number }
+export type Span = { text: string; color?: string; bold?: boolean }
+export type BandItem = { id: string; width: number; keep?: boolean }
+export type Meter = { id: string; spans: Span[]; keep?: boolean }
+
+/** The default partition from `sinfo -h -o %P` (the one marked *), else the first listed. */
+export function defaultPartition(stdout: string): string {
+  const names = stdout.split('\n').map(s => s.trim()).filter(Boolean)
+  return (names.find(n => n.endsWith('*')) ?? names[0] ?? '').replace(/\*$/, '')
+}
+
+/** Nodes by state and GPUs from `sinfo -h -N -O Gres,GresUsed,StateCompact`; free GPUs are those on idle and partly used nodes. */
+export function parseCluster(stdout: string, partition: string): Cluster {
+  const c: Cluster = { partition, nodes: 0, gpus: 0, free: 0, full: 0, partly: 0, idle: 0, reserved: 0, down: 0 }
+  for (const line of stdout.split('\n')) {
+    const [gres = '', used = '', raw = ''] = line.trim().split(/\s+/)
+    if (!raw) continue
+    const state = raw.replace(/[*~#!%$@^+-]+$/, '').toLowerCase()
+    // gpu:4(S:0-3) or gpu:gh200:4(...); in use: gpu:gh200:2(IDX:0-1) or gpu:(null):0(IDX:N/A)
+    const total = Number(/gpu:(?:[A-Za-z(][^:\s]*:)?(\d+)/.exec(gres)?.[1] ?? 0)
+    const inUse = Number(/gpu:(?:[A-Za-z(][^:\s]*:)?(\d+)\(IDX/.exec(used)?.[1] ?? 0)
+    c.nodes += 1
+    c.gpus += total
+    if (state === 'idle') { c.idle += 1; c.free += total }
+    else if (state === 'mix') { c.partly += 1; c.free += Math.max(0, total - inUse) }
+    else if (state === 'alloc' || state === 'comp' || state === 'drng') c.full += 1
+    else if (state === 'resv' || state === 'maint' || state === 'plnd') c.reserved += 1
+    else c.down += 1
+  }
+  return c
+}
+
+/** Space and files from `lfs quota -p <id> <path>` (kbytes, no -h); undefined when the table is not there. */
+export function parseQuota(stdout: string): Quota | undefined {
+  const lines = stdout.split('\n')
+  const head = lines.findIndex(l => /\bkbytes\b/.test(l))
+  if (head < 0) return undefined
+  // path, kbytes, quota, limit, grace, files, quota, limit, grace: a long path puts the numbers on the next line
+  const t = lines.slice(head + 1).join(' ').trim().split(/\s+/)
+  const num = (s?: string) => Number(String(s ?? '').replace(/\*$/, ''))
+  const usedKB = num(t[1]), files = num(t[5])
+  if (!Number.isFinite(usedKB) || !Number.isFinite(files)) return undefined
+  return { usedKB, limitKB: num(t[3]) || num(t[2]), files, filesLimit: num(t[7]) || num(t[6]) }
+}
+
+/** Kilobytes as TB the way `lfs quota -h` prints them (powers of 1024): 72.8, 200. */
+export function tib(kb: number): string {
+  const t = kb / 1024 ** 3
+  return t >= 100 ? t.toFixed(0) : t.toFixed(1)
+}
+
+/** The project's name from a /projects/<name>/ path, else its Lustre project id. */
+export function projectName(path: string, id: string): string {
+  return /\/projects\/([^/]+)/.exec(path)?.[1] ?? `project ${id}`
+}
+
+/** 1388 -> 1.4k, 6 -> 6. */
+function compact(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/** A fill of `width` cells: whole blocks, one eighth-block edge, then a dim track. */
+export function fillBar(fraction: number, width: number, color: string): Span[] {
+  const eighths = Math.round(Math.max(0, Math.min(1, fraction)) * width * 8)
+  const whole = Math.floor(eighths / 8), rest = eighths % 8
+  const used = whole + (rest ? 1 : 0)
+  return [{ text: '█'.repeat(whole), color }, { text: rest ? EIGHTHS[rest]! : '', color }, { text: '░'.repeat(Math.max(0, width - used)), color: COLORS.track }]
+    .filter(s => s.text)
+}
+
+/** 5280 -> 5,280. */
+function grouped(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+/** "workq: 1,388 of 5,280 GPUs free · 871 full, 341 partly used, 6 idle nodes" for /queue refresh; '' before the first read. */
+function clusterText(): string {
+  if (!cluster) return ''
+  const c = cluster
+  return `${c.partition}: ${grouped(c.free)} of ${grouped(c.gpus)} GPUs free · ${c.full} full, ${c.partly} partly used, ${c.idle} idle nodes`
+}
+
+/** "b5ak: 72.8 / 200 TB (36%), files 4.0 / 51.2 M" for /queue refresh; '' off Lustre. */
+function storageText(): string {
+  if (!storage) return ''
+  const s = storage
+  const share = s.limitKB ? ` (${Math.round((s.usedKB / s.limitKB) * 100)}%)` : ''
+  return `${s.project}: ${tib(s.usedKB)} / ${tib(s.limitKB)} TB${share}, files ${(s.files / 1e6).toFixed(1)} / ${(s.filesLimit / 1e6).toFixed(1)} M`
+}
+
+/** The ids that fit in `width`, items given most important first; a `keep` item is never dropped. */
+export function fitBand(items: BandItem[], width: number, gap = 2): string[] {
+  const kept = [...items]
+  const total = () => kept.reduce((sum, it) => sum + it.width, 0) + gap * Math.max(0, kept.length - 1)
+  for (let i = kept.length - 1; i >= 0 && total() > width; i--) if (!kept[i]!.keep) kept.splice(i, 1)
+  return kept.map(it => it.id)
+}
+
+/** `a` moved toward `b` by `t`, as #RRGGBB. */
+function mix(a: string, b: string, t: number): string {
+  const rgb = (h: string) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
+  const x = rgb(a), y = rgb(b)
+  return `#${x.map((v, i) => Math.round(v + (y[i]! - v) * t).toString(16).padStart(2, '0')).join('').toUpperCase()}`
+}
+
+/** fillBar with each fill cell shaded by position from load to label blue, so the edge is lit; `glint` (0-1) lifts the edge toward white. */
+export function gpuBar(fraction: number, width: number, glint: number): Span[] {
+  const spans = fillBar(fraction, width, COLORS.load)
+  const fill = [...spans.filter(s => s.color === COLORS.load).map(s => s.text).join('')]
+  const cells: Span[] = fill.map((text, i) => ({ text, color: mix(COLORS.load, COLORS.label, width > 1 ? i / (width - 1) : 1) }))
+  const edge = cells.at(-1)
+  if (edge && glint > 0) edge.color = mix(edge.color!, '#FFFFFF', 0.5 * glint)
+  return [...cells, ...spans.filter(s => s.color !== COLORS.load)]
+}
+
+/** Cells a run of spans takes. */
+export function cells(spans: Span[]): number {
+  return spans.reduce((n, s) => n + s.text.length, 0)
+}
+
+/** The live meters with bars of `bar` cells, in display order: GPUs in use, disk, NHR, tunnel time left; each only once known. */
+function meters(bar: number): Meter[] {
+  const shown: Meter[] = []
+  if (cluster?.gpus) {
+    // shown.push({ id: 'gpu', spans: [{ text: 'gpu ', color: COLORS.dim }, ...fillBar(1 - cluster.free / cluster.gpus, bar, COLORS.load), { text: ` ${compact(cluster.free)} free` }] })
+    // the count is padded to 4 cells (1.4k) so a roll never shifts the band; its colour follows the reading, not the roll
+    const free = Math.round(gpuShown ?? cluster.free)
+    const scarce = cluster.free < cluster.gpus * GPU_SCARCE
+    shown.push({ id: 'gpu', spans: [{ text: 'gpu ', color: COLORS.dim }, ...gpuBar(1 - free / cluster.gpus, bar, gpuGlint), { text: ' ' }, { text: compact(free).padStart(4), color: scarce ? COLORS.wait : undefined }, { text: ' free', color: COLORS.dim }] })
+  }
+  if (storage?.limitKB) {
+    const share = storage.usedKB / storage.limitKB
+    const color = share >= 0.9 ? COLORS.high : share >= STORAGE_WARN ? COLORS.wait : COLORS.label
+    shown.push({ id: 'disk', spans: [{ text: 'disk ', color: COLORS.dim }, ...fillBar(share, bar, color), { text: ` ${Math.round(share * 100)}%` }] })
+  }
+  const nhr = usageText(usage).replace(/ NHR this month$/, '')
+  if (nhr) shown.push({ id: 'nhr', spans: [{ text: nhr }, { text: ' NHR', color: COLORS.dim }] })
+  const tunnel = groups.find(g => g.name === tunnelName && g.running)
+  if (tunnel) {
+    const soon = tunnel.leftS >= 0 && tunnel.leftS <= TUNNEL_WARN_S
+    shown.push({ id: 'tunnel', keep: true, spans: [{ text: 'tunnel ', color: COLORS.dim }, { text: span(tunnel.leftS), color: soon ? COLORS.warn : undefined, bold: soon }, { text: ' left', color: COLORS.dim }] })
+  }
+  return shown
+}
+
 // module state; a reload starts it over and the first poll fills it again
 let tunnelName = 'code_tunnel'
 let contextOn = true
@@ -142,6 +330,17 @@ const groupLog = new Map<string, string>() // group key -> a running task's log 
 let wakeOn = false
 const ownJobs = new Map<string, { at: number; seen: boolean }>() // job ids this session's main loop submitted (wake only)
 let endedLines: string[] = [] // told to the model on its next prompt, then forgotten
+let usage = new Map<string, number>() // GPU minutes this month per account
+let usageAt = -Infinity // last time the usage counter was read
+let partition = '' // the default partition, found once
+let cluster: Cluster | undefined
+let clusterAt = -Infinity
+let gpuShown: number | undefined // the free count while it rolls to a new reading
+let gpuGlint = 0 // 1 as a reading lands, 0 at rest
+let gpuTween: Timer | undefined
+let storagePath = '' // option storagePath, else the session's folder
+let storage: (Quota & { project: string }) | undefined
+let storageAt = -Infinity
 
 type AcctRow = { id: string; state: string; out: string; name: string; raw: string; user: string; workDir: string; comment: string }
 type EndedInfo = { counts: Map<string, number>; first?: AcctRow; failed?: AcctRow; isArray: boolean }
@@ -191,6 +390,74 @@ async function readLogs($: EngineInterface, next: Group[], before: Group[]) {
     } catch {
       // a log that cannot be read leaves the group without one
     }
+  }
+}
+
+/** This month's GPU minutes, read at most every USAGE_MS; a failed read keeps the last figure. */
+async function readUsage($: EngineInterface) {
+  if (triedAt - usageAt < USAGE_MS) return
+  usageAt = triedAt
+  try {
+    const r = await run($, ['scontrol', 'show', 'assoc_mgr', `users=${user}`, 'flags=assoc'], 10_000)
+    if (r.exitCode === 0) usage = parseGpuMinutes(r.stdout)
+  } catch {
+    // an unreadable counter keeps the last figure
+  }
+}
+
+/** The default partition's nodes and GPUs, at most every CLUSTER_MS; a failed read keeps the last picture. */
+async function readCluster($: EngineInterface) {
+  if (triedAt - clusterAt < CLUSTER_MS) return
+  clusterAt = triedAt
+  try {
+    if (!partition) {
+      const listed = await run($, ['sinfo', '-h', '-o', '%P'], 15_000)
+      if (listed.exitCode === 0) partition = defaultPartition(listed.stdout)
+      if (!partition) return
+    }
+    const r = await run($, ['sinfo', '-h', '-N', '-p', partition, '-O', 'Gres:40,GresUsed:60,StateCompact:16'], 20_000)
+    const next = r.exitCode === 0 ? parseCluster(r.stdout, partition) : undefined
+    // if (next?.nodes) cluster = next
+    const before = cluster
+    if (next?.nodes) cluster = next
+    if (before && next?.nodes && next.free !== before.free) settle($, gpuShown ?? before.free, next.free)
+  } catch {
+    // an unreadable sinfo keeps the last picture
+  }
+}
+
+/** A changed reading: the count rolls and the edge glides from what is shown, the edge glints; the timer stops itself after 1.2 s. */
+function settle($: EngineInterface, from: number, to: number) {
+  gpuTween?.cancel()
+  gpuShown = from
+  gpuGlint = 1
+  let tick = 0
+  gpuTween = $.clock.every(TICK_MS, () => {
+    tick += 1
+    gpuShown = from + (to - from) * (1 - (1 - Math.min(1, tick / EASE_TICKS)) ** 3) // ease-out cubic
+    gpuGlint = Math.max(0, 1 - tick / GLINT_TICKS) ** 2
+    if (tick >= GLINT_TICKS) {
+      gpuShown = undefined
+      gpuGlint = 0
+      gpuTween?.cancel()
+    }
+    $.ui.invalidate('ui.render')
+  })
+}
+
+/** The Lustre project quota of the storage folder, at most every STORAGE_MS; nothing off Lustre. */
+async function readStorage($: EngineInterface) {
+  if (!storagePath || triedAt - storageAt < STORAGE_MS) return
+  storageAt = triedAt
+  try {
+    const project = await run($, ['lfs', 'project', '-d', storagePath], 15_000)
+    const id = /^(\d+)/.exec(project.stdout.trim())?.[1]
+    if (project.exitCode !== 0 || !id || id === '0') return
+    const quota = await run($, ['lfs', 'quota', '-p', id, storagePath], 20_000)
+    const parsed = quota.exitCode === 0 ? parseQuota(quota.stdout) : undefined
+    if (parsed) storage = { ...parsed, project: projectName(storagePath, id) }
+  } catch {
+    // an unreadable quota keeps the last figure
   }
 }
 
@@ -346,6 +613,9 @@ async function pollOnce($: EngineInterface) {
     if (r.exitCode !== 0) throw new Error(r.stderr.trim().split('\n')[0] || `squeue exited ${r.exitCode}`)
     const next = collapse(parseRows(r.stdout))
     await readLogs($, next, groups)
+    await readUsage($)
+    await readCluster($)
+    await readStorage($)
     if (primed) await announce($, groups, next)
     groups = next
     polledAt = triedAt
@@ -382,8 +652,10 @@ export const register: Register = (on, options) => {
   tunnelName = String(options.tunnelName ?? 'code_tunnel').trim() || 'code_tunnel'
   contextOn = String(options.context ?? 'on') !== 'off'
   wakeOn = String(options.wake ?? 'off') === 'on'
+  storagePath = String(options.storagePath ?? '').trim()
 
   on('session.start', async ($, e, next) => {
+    if (!storagePath) storagePath = e.cwd // the project quota of the folder the session works in
     if (await probe($)) {
       void poll($) // first, so a refused command name cannot stop the polling
       try {
@@ -401,7 +673,9 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     if (e.args.trim() === 'refresh' || now - triedAt > MIN_GAP_MS) await poll($)
     if (e.args.trim() === 'refresh') {
-      return { text: groups.length ? groups.map(describe).join('\n') : failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.' }
+      // return { text: groups.length ? groups.map(describe).join('\n') : failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.' }
+      const queueText = groups.length ? groups.map(describe).join('\n') : failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.'
+      return { text: [queueText, usageText(usage), clusterText(), storageText()].filter(Boolean).join('\n') }
     }
     await $.ui.open({ id: PANE, title: 'Slurm queue' })
     return { text: 'Slurm queue pane opened.' }
@@ -442,20 +716,45 @@ export const register: Register = (on, options) => {
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
     const shown = jobs.slice(0, 3)
+    // return (
+    //   <Box flexDirection="row" gap={1}>
+    //     <Text color="#7DC4FF" bold>slurm</Text>
+    //     {shown.map(g => (
+    //       <Text>
+    //         <Text color={g.running ? '#5FD17A' : '#E0B050'}>{g.name}</Text>
+    //         {g.isArray
+    //           ? ` ${g.running ? `${g.running} run` : ''}${g.running && g.pending ? ' · ' : ''}${g.pending ? `${g.pending} wait` : ''}`
+    //           : g.running ? ` ${span(seconds(g.elapsed))} · ${span(g.leftS)} left` : ` wait${g.reason ? ` (${g.reason})` : ''}`}
+    //       </Text>
+    //     ))}
+    //     {jobs.length > shown.length && <Text dimColor>+{jobs.length - shown.length} more · /queue</Text>}
+    //     {tunnel && <Text color={tunnel.leftS >= 0 && tunnel.leftS <= TUNNEL_WARN_S ? '#FFD34E' : '#8A94AB'}>│ tunnel {span(tunnel.leftS)} left</Text>}
+    //     {usage.size > 0 && <Text color="#8A94AB">│ {usageText(usage)}</Text>}
+    //     {failures > 0 && <Text dimColor>· as of {age(now)} ago, squeue failing</Text>}
+    //   </Box>
+    // )
+    const job = (g: Group): Span[] => [
+      { text: g.name, color: g.running ? COLORS.run : COLORS.wait },
+      { text: g.isArray
+        ? ` ${g.running ? `${g.running} run` : ''}${g.running && g.pending ? ' · ' : ''}${g.pending ? `${g.pending} wait` : ''}`
+        : g.running ? ` ${span(seconds(g.elapsed))} · ${span(g.leftS)} left` : ` wait${g.reason ? ` (${g.reason})` : ''}` },
+    ]
+    const live = meters(8)
+    const [gpu, disk, nhr, tunnelTime] = ['gpu', 'disk', 'nhr', 'tunnel'].map(id => live.find(m => m.id === id))
+    const head: Meter = { id: 'job0', keep: true, spans: [{ text: 'slurm', color: COLORS.label, bold: true }, ...(shown[0] ? [{ text: ' ' }, ...job(shown[0])] : [])] }
+    const rest = shown.slice(1).map((g, i): Meter => ({ id: `job${i + 1}`, spans: job(g) }))
+    // width kept for "+n more" whenever a job could be left out
+    const more: Meter | undefined = jobs.length > 1 ? { id: 'more', keep: true, spans: [{ text: `+${jobs.length - 1} more`, color: COLORS.dim }] } : undefined
+    const stale: Meter | undefined = failures ? { id: 'stale', keep: true, spans: [{ text: `as of ${age(now)} ago, squeue failing`, color: COLORS.dim }] } : undefined
+    // most important first: what fitBand drops is taken from the end
+    const byRank = [head, tunnelTime, stale, more, rest[0], nhr, gpu, disk, rest[1]].filter((m): m is Meter => !!m)
+    const kept = new Set(fitBand(byRank.map(m => ({ id: m.id, width: cells(m.spans), keep: m.keep })), e.props.bodyColumns))
+    const left = jobs.length - shown.filter((_, i) => kept.has(`job${i}`)).length
+    const told: Meter | undefined = more && left > 0 ? { ...more, spans: [{ text: `+${left} more`, color: COLORS.dim }] } : undefined
+    const row = [head, ...rest, told, stale, gpu, disk, nhr, tunnelTime].filter((m): m is Meter => !!m && kept.has(m.id))
     return (
-      <Box flexDirection="row" gap={1}>
-        <Text color="#7DC4FF" bold>slurm</Text>
-        {shown.map(g => (
-          <Text>
-            <Text color={g.running ? '#5FD17A' : '#E0B050'}>{g.name}</Text>
-            {g.isArray
-              ? ` ${g.running ? `${g.running} run` : ''}${g.running && g.pending ? ' · ' : ''}${g.pending ? `${g.pending} wait` : ''}`
-              : g.running ? ` ${span(seconds(g.elapsed))} · ${span(g.leftS)} left` : ` wait${g.reason ? ` (${g.reason})` : ''}`}
-          </Text>
-        ))}
-        {jobs.length > shown.length && <Text dimColor>+{jobs.length - shown.length} more · /queue</Text>}
-        {tunnel && <Text color={tunnel.leftS >= 0 && tunnel.leftS <= TUNNEL_WARN_S ? '#FFD34E' : '#8A94AB'}>│ tunnel {span(tunnel.leftS)} left</Text>}
-        {failures > 0 && <Text dimColor>· as of {age(now)} ago, squeue failing</Text>}
+      <Box flexDirection="row" justifyContent="space-between" width={e.props.bodyColumns}>
+        {row.map(m => <Text>{m.spans.map(s => <Text color={s.color} bold={s.bold}>{s.text}</Text>)}</Text>)}
       </Box>
     )
   })
@@ -463,15 +762,27 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
+    // the running tunnel is told in the meter row, not again in the list
+    const jobs = groups.filter(g => !(g.name === tunnelName && g.running))
+    // bars grow with the pane: 8 cells at 60 columns, 22 at 160, never past 24
+    const row = meters(Math.max(6, Math.min(24, Math.floor(e.props.bodyColumns / 7))))
     return (
       <Box flexDirection="column">
-        {!groups.length && <Text dimColor>{failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.'}</Text>}
-        {groups.map(g => (
+        {row.length > 0 && (
+          <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" columnGap={2} marginBottom={1}>
+            {row.map(m => <Text>{m.spans.map(s => <Text color={s.color} bold={s.bold}>{s.text}</Text>)}</Text>)}
+          </Box>
+        )}
+        {/* {!groups.length && <Text dimColor>{failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.'}</Text>} */}
+        {!jobs.length && <Text dimColor>{failures ? `squeue failing: ${lastError}` : 'No jobs in the queue.'}</Text>}
+        {/* {groups.map(g => ( */}
+        {jobs.map(g => (
           <Box flexDirection="column">
             <Text color={g.running ? '#5FD17A' : '#E0B050'}>{describe(g)}</Text>
             {g.log && <Text dimColor>  {g.log}</Text>}
           </Box>
         ))}
+        {/* {usage.size > 0 && <Text>{usageText(usage)} (your own jobs, from the Slurm usage counter; the portal is the reference)</Text>} */}
         <Text dimColor>as of {age(now)} ago · next look in {groups.length && !failures ? '1 min' : '5 min'} · /queue refresh</Text>
       </Box>
     )
